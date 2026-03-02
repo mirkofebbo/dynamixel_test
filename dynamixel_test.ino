@@ -1,136 +1,195 @@
 #include <Dynamixel2Arduino.h>
 
 #if defined(ARDUINO_OpenRB)
-#define DXL_SERIAL Serial1
-#define DEBUG_SERIAL Serial
-const int DXL_DIR_PIN = -1;
+  #define DXL_SERIAL   Serial1
+  #define USB_SERIAL   Serial      // PC <-> OpenRB over USB
+  const int DXL_DIR_PIN = -1;
 #else
-#error "Select OpenRB-150 board in Tools > Board"
+  #error "Select OpenRB-150 board in Tools > Board"
 #endif
 
 Dynamixel2Arduino dxl(DXL_SERIAL, DXL_DIR_PIN);
 
-const float PROTOCOL_VER = 1.0;
+const float    PROTOCOL_VER = 1.0;
 const uint32_t DXL_BAUD = 1000000;
 
-const uint8_t IDS[] = { 1, 2, 3 };
+const uint8_t IDS[] = {1, 2, 3};
 const uint8_t N = sizeof(IDS) / sizeof(IDS[0]);
 
-// limits for motion
-const uint16_t MIN_POS = 250;
-const uint16_t MAX_POS = 750;
+// ---- Tuning knobs ----
+const uint16_t APPLY_HZ = 50;               // Dynamixel write rate
+const uint32_t APPLY_PERIOD_MS = 1000 / APPLY_HZ;
+const uint32_t WATCHDOG_MS = 200;           // if no command this long -> stop applying
+const bool     TORQUE_OFF_ON_TIMEOUT = false; // if true, torque off when timed out
 
-// Speed setup
-const uint16_t BASE_SPEED = 100;
-const uint16_t MIN_SPEED = 10;
-const uint16_t MAX_SPEED = 120;
+// Cached "latest" commands
+volatile bool     pending[N] = {false, false, false};
+volatile uint16_t goalPos[N] = {512, 512, 512};
+volatile uint16_t goalSpd[N] = {80,  80,  80};
+volatile uint32_t lastCmdMs  = 0;
 
-void centerAllMotors(uint16_t speed = MAX_SPEED) {
-  DEBUG_SERIAL.println("Centering");
-
-  // Set a gentle speed for all motors
+bool isValidId(uint8_t id, uint8_t &idxOut) {
   for (uint8_t i = 0; i < N; i++) {
-    dxl.writeControlTableItem(ControlTableItem::MOVING_SPEED, IDS[i], speed);
+    if (IDS[i] == id) { idxOut = i; return true; }
+  }
+  return false;
+}
+
+// ---- CRC16 (Modbus polynomial 0xA001) ----
+uint16_t crc16_modbus(const uint8_t* buf, int len) {
+  uint16_t crc = 0xFFFF;
+  for (int pos = 0; pos < len; pos++) {
+    crc ^= (uint16_t)buf[pos];
+    for (int i = 0; i < 8; i++) {
+      if (crc & 0x0001) { crc >>= 1; crc ^= 0xA001; }
+      else { crc >>= 1; }
+    }
+  }
+  return crc;
+}
+
+// ---- Packet parser (non-blocking) ----
+static const uint8_t STX1 = 0xAA;
+static const uint8_t STX2 = 0x55;
+
+uint8_t rxBuf[64];
+uint8_t rxPos = 0;
+uint8_t expectedTotal = 0;
+
+// Returns true if a complete valid packet was parsed into rxBuf
+bool tryParseOnePacket() {
+  while (USB_SERIAL.available() > 0) {
+    uint8_t b = (uint8_t)USB_SERIAL.read();
+
+    if (rxPos == 0) {                 // look for STX1
+      if (b == STX1) rxBuf[rxPos++] = b;
+      continue;
+    }
+    if (rxPos == 1) {                 // look for STX2
+      if (b == STX2) rxBuf[rxPos++] = b;
+      else rxPos = 0;
+      continue;
+    }
+
+    if (rxPos == 2) {                 // LEN
+      rxBuf[rxPos++] = b;
+      uint8_t len = b;
+      expectedTotal = 2 + 1 + len + 2; // stx(2) + len(1) + (cmd+payload=len) + crc(2)
+      if (expectedTotal > sizeof(rxBuf) || expectedTotal < 6) { // minimum sanity
+        rxPos = 0; expectedTotal = 0;
+      }
+      continue;
+    }
+
+    // rest of packet
+    rxBuf[rxPos++] = b;
+
+    if (expectedTotal && rxPos >= expectedTotal) {
+      // Validate CRC
+      uint16_t got  = (uint16_t)rxBuf[expectedTotal - 2] | ((uint16_t)rxBuf[expectedTotal - 1] << 8);
+      uint16_t calc = crc16_modbus(&rxBuf[2], 1 + rxBuf[2]); // LEN + (CMD+payload)
+
+      // Reset state for next packet before returning
+      rxPos = 0;
+      expectedTotal = 0;
+
+      if (got == calc) return true;
+      // CRC bad -> ignore, continue parsing remaining bytes
+    }
+  }
+  return false;
+}
+
+void cachePacketAsLatest() {
+  uint8_t len = rxBuf[2];
+  uint8_t cmd = rxBuf[3];
+
+  if (cmd != 0x01) return;           // only one command for now
+  if (len != (1 + 5)) return;        // cmd + payload size
+
+  uint8_t id = rxBuf[4];
+  uint16_t pos = (uint16_t)rxBuf[5] | ((uint16_t)rxBuf[6] << 8);
+  uint16_t spd = (uint16_t)rxBuf[7] | ((uint16_t)rxBuf[8] << 8);
+
+  uint8_t idx;
+  if (!isValidId(id, idx)) return;
+
+  if (pos > 1023) pos = 1023;
+  if (spd == 0) spd = 1;
+  if (spd > 1023) spd = 1023;
+
+  goalPos[idx] = pos;
+  goalSpd[idx] = spd;
+  pending[idx] = true;
+  lastCmdMs = millis();
+}
+
+void drainSerialKeepLatest() {
+  bool gotAny = false;
+  // Keep parsing packets until no more complete packets are available.
+  while (tryParseOnePacket()) {
+    cachePacketAsLatest();
+    gotAny = true;
+  }
+  (void)gotAny;
+}
+
+void applyLatestIfDue() {
+  static uint32_t lastApplyMs = 0;
+  uint32_t now = millis();
+
+  if (now - lastApplyMs < APPLY_PERIOD_MS) return;
+  lastApplyMs = now;
+
+  // Watchdog: if the PC stopped sending, stop applying updates
+  if (now - lastCmdMs > WATCHDOG_MS) {
+    if (TORQUE_OFF_ON_TIMEOUT) {
+      for (uint8_t i = 0; i < N; i++) dxl.torqueOff(IDS[i]);
+    }
+    // Clear pending so old cached values don't apply later
+    for (uint8_t i = 0; i < N; i++) pending[i] = false;
+    return;
   }
 
-  // Send center position
+  // Apply any pending latest goals
   for (uint8_t i = 0; i < N; i++) {
+    if (!pending[i]) continue;
+    pending[i] = false;
+
+    uint8_t id = IDS[i];
+    dxl.writeControlTableItem(ControlTableItem::MOVING_SPEED, id, goalSpd[i]);
+    dxl.setGoalPosition(id, goalPos[i]);
+  }
+}
+
+void centerAllMotors(uint16_t speed = 80) {
+  for (uint8_t i = 0; i < N; i++) {
+    dxl.writeControlTableItem(ControlTableItem::MOVING_SPEED, IDS[i], speed);
     dxl.setGoalPosition(IDS[i], 512);
   }
 }
 
 void setup() {
-  DEBUG_SERIAL.begin(115200);
-  while (!DEBUG_SERIAL) {}
+  USB_SERIAL.begin(115200);
+  while (!USB_SERIAL) {}
 
   dxl.begin(DXL_BAUD);
   dxl.setPortProtocolVersion(PROTOCOL_VER);
 
-  // Ping + torque on all motors
   for (uint8_t i = 0; i < N; i++) {
-    uint8_t id = IDS[i];
-    DEBUG_SERIAL.print("Pinging ID ");
-    DEBUG_SERIAL.print(id);
-    DEBUG_SERIAL.print("... ");
-    if (!dxl.ping(id)) {
-      DEBUG_SERIAL.println("FAIL");
-      while (1) {}
-    }
-    DEBUG_SERIAL.println("OK");
-
-    dxl.torqueOff(id);
-    dxl.torqueOn(id);
+    if (!dxl.ping(IDS[i])) while (1) {}
+    dxl.torqueOff(IDS[i]);
+    dxl.torqueOn(IDS[i]);
   }
 
-  randomSeed(analogRead(A0));  
-
-  DEBUG_SERIAL.println("All motors ready.");
-
+  lastCmdMs = millis();
   centerAllMotors();
-
-  delay(500);  
-}
-
-bool anyMoving() {
-  for (uint8_t i = 0; i < N; i++) {
-    uint8_t id = IDS[i];
-    uint8_t moving = dxl.readControlTableItem(ControlTableItem::MOVING, id);
-    if (moving != 0) return true;
-  }
-  return false;
-}
-
-uint16_t clampSpeed(uint16_t s) {
-  if (s < MIN_SPEED) return MIN_SPEED;
-  if (s > MAX_SPEED) return MAX_SPEED;
-  return s;
 }
 
 void loop() {
-  uint16_t present[N];
-  uint16_t goal[N];
-  uint16_t dist[N];
-  if (anyMoving()) return;
+  // 1) Drain serial fast, keeping only latest commands
+  drainSerialKeepLatest();
 
-  for (uint8_t i = 0; i < N; i++) {
-    uint8_t id = IDS[i];
-    present[i] = (uint16_t)dxl.getPresentPosition(id);  
-    goal[i] = random(MIN_POS, MAX_POS + 1);
-    dist[i] = (present[i] > goal[i]) ? (present[i] - goal[i]) : (goal[i] - present[i]);
-  }
-
-  // 2) Find the maximum distance
-  uint16_t maxDist = 0;
-  for (uint8_t i = 0; i < N; i++) {
-    if (dist[i] > maxDist) maxDist = dist[i];
-  }
-  if (maxDist == 0) maxDist = 1;  // avoid divide by zero if all already at goal
-
-  // 3) Set per-motor speed so they finish together
-  for (uint8_t i = 0; i < N; i++) {
-    uint8_t id = IDS[i];
-
-    // proportional speed (farthest motor uses BASE_SPEED)
-    uint16_t spd = (uint32_t)BASE_SPEED * dist[i] / maxDist;
-    spd = clampSpeed(spd);
-
-    dxl.writeControlTableItem(ControlTableItem::MOVING_SPEED, id, spd);
-
-    DEBUG_SERIAL.print("ID ");
-    DEBUG_SERIAL.print(id);
-    DEBUG_SERIAL.print(" present=");
-    DEBUG_SERIAL.print(present[i]);
-    DEBUG_SERIAL.print(" goal=");
-    DEBUG_SERIAL.print(goal[i]);
-    DEBUG_SERIAL.print(" dist=");
-    DEBUG_SERIAL.print(dist[i]);
-    DEBUG_SERIAL.print(" speed=");
-    DEBUG_SERIAL.println(spd);
-  }
-
-  // 4) Send all goal positions
-  for (uint8_t i = 0; i < N; i++) {
-    dxl.setGoalPosition(IDS[i], goal[i]);
-  }
-
+  // 2) Apply latest cached commands at fixed rate + watchdog
+  applyLatestIfDue();
 }
