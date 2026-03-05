@@ -14,14 +14,15 @@ Dynamixel2Arduino dxl(DXL_SERIAL, DXL_DIR_PIN);
 static constexpr float    PROTOCOL_VER = 1.0;
 static constexpr uint32_t DXL_BAUD     = 1000000;
 
-static constexpr uint8_t  IDS[] = {1, 2, 3};
-static constexpr uint8_t  N     = sizeof(IDS) / sizeof(IDS[0]);
+static constexpr uint8_t  IDS[] = {1, 2, 3}; // num of motors
+static constexpr uint8_t  N     = sizeof(IDS) / sizeof(IDS[0]); // total num of motors
 
 static constexpr uint16_t POS_MAX = 1023;
 static constexpr uint16_t SPD_MIN = 1;
 static constexpr uint16_t SPD_MAX = 1023;
 
 // ---- Protocol ----
+// [AA][55][LEN][CMD][payload...][CRC_L][CRC_H]
 static constexpr uint8_t STX1 = 0xAA;
 static constexpr uint8_t STX2 = 0x55;
 
@@ -33,9 +34,9 @@ enum Command : uint8_t {
 };
 
 // ---- Timing ----
-static constexpr uint16_t APPLY_HZ        = 100;                 // try 100Hz for snappier sync
+static constexpr uint16_t APPLY_HZ        = 100;  
 static constexpr uint32_t APPLY_PERIOD_MS = 1000 / APPLY_HZ;
-static constexpr uint32_t WATCHDOG_MS     = 200;
+static constexpr uint32_t WATCHDOG_MS     = 200; // Stop applying old command after this delay without msg
 static constexpr bool     TORQUE_OFF_ON_TIMEOUT = false;
 
 // ---- State ----
